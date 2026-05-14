@@ -6590,6 +6590,170 @@ def _ensure_fhs_path_guard() -> None:
         print("    (reload your shell or run 'source ~/.bashrc' to pick it up)")
 
 
+def _update_b00t_if_present(quiet: bool = False) -> None:
+    """Update b00t ecosystem (CLI + MCP) when the repo is present.
+
+    Checks ~/.b00t for a git repo, fast-forward pulls main, and if new
+    commits arrived, rebuilds b00t-cli + b00t-mcp in release mode, then
+    symlinks the fresh binaries to ~/.local/bin/.
+
+    Safe no-op when ~/.b00t is absent or isn't a git checkout.  Never
+    raises — any failure is logged at debug level and silently swallowed.
+    """
+    b00t_dir = Path.home() / ".b00t"
+    git_dir = b00t_dir / ".git"
+    if not git_dir.is_dir():
+        return
+
+    if not quiet:
+        print()
+        print("→ Updating b00t ecosystem...")
+
+    try:
+        # Fetch + fast-forward pull (like hermes itself)
+        fetch = subprocess.run(
+            ["git", "fetch", "origin"],
+            cwd=b00t_dir,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if fetch.returncode != 0:
+            if not quiet:
+                print(
+                    f"  ⚠ Cannot fetch b00t: {fetch.stderr.strip().splitlines()[0]}"
+                )
+            return
+
+        revs = subprocess.run(
+            ["git", "rev-list", "HEAD..origin/main", "--count"],
+            cwd=b00t_dir,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if revs.returncode != 0:
+            return
+
+        commit_count = int(revs.stdout.strip())
+        if commit_count == 0:
+            if not quiet:
+                # Check if binaries actually exist before claiming up-to-date
+                cli_bin = shutil.which("b00t-cli") or Path.home() / ".local/bin/b00t-cli"
+                mcp_bin = shutil.which("b00t-mcp") or Path.home() / ".local/bin/b00t-mcp"
+                if not Path(cli_bin).is_file() or not Path(mcp_bin).is_file():
+                    if not quiet:
+                        print("  ✓ Already up to date, rebuilding missing binaries...")
+                        _rebuild_b00t_binaries(b00t_dir, quiet)
+                else:
+                    if not quiet:
+                        print("  ✓ b00t is up to date")
+            return
+
+        if not quiet:
+            print(f"  → {commit_count} new commit(s) pulled")
+
+        # Fast-forward pull
+        pull = subprocess.run(
+            ["git", "pull", "--ff-only", "origin", "main"],
+            cwd=b00t_dir,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if pull.returncode != 0:
+            if not quiet:
+                print("  ⚠ Fast-forward failed — unresolved local changes in ~/.b00t")
+                print("    Resolve manually, then run: cd ~/.b00t && git pull")
+            return
+
+        _rebuild_b00t_binaries(b00t_dir, quiet)
+
+        # Update vendor submodules (irontology-mcp, ledgrrr, etc.) if any
+        if (b00t_dir / ".gitmodules").is_file():
+            try:
+                sm_fetch = subprocess.run(
+                    ["git", "submodule", "update", "--init", "--recursive"],
+                    cwd=b00t_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                if sm_fetch.returncode == 0 and sm_fetch.stdout.strip():
+                    updated = [
+                        l.strip() for l in sm_fetch.stdout.strip().splitlines()
+                        if "Submodule" in l or l.endswith("...")
+                    ]
+                    if updated:
+                        if not quiet:
+                            for line in updated:
+                                print(f"    {line}")
+                elif sm_fetch.returncode != 0 and not quiet:
+                    print("  ⚠ Submodule update had issues (non-fatal)")
+            except subprocess.TimeoutExpired:
+                if not quiet:
+                    print("  ⚠ Submodule update timed out (2 min limit)")
+            except Exception as exc:
+                logger.debug("b00t submodule update failed: %s", exc)
+
+    except subprocess.TimeoutExpired:
+        if not quiet:
+            print("  ⚠ b00t update timed out (network or build)")
+    except Exception as exc:
+        logger.debug("b00t post-update hook failed: %s", exc)
+
+
+def _rebuild_b00t_binaries(b00t_dir: Path, quiet: bool = False) -> None:
+    """Build b00t-cli and b00t-mcp in release mode and install symlinks."""
+    if not quiet:
+        print("  → Building b00t-cli + b00t-mcp (release)...")
+    try:
+        build = subprocess.run(
+            [
+                "cargo",
+                "build",
+                "--release",
+                "--manifest-path",
+                str(b00t_dir / "Cargo.toml"),
+                "-p",
+                "b00t-cli",
+                "-p",
+                "b00t-mcp",
+            ],
+            cwd=b00t_dir,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if build.returncode != 0:
+            if not quiet:
+                print("  ✗ Build failed. Check ~/.b00t for compilation errors.")
+                for line in build.stderr.strip().splitlines()[-5:]:
+                    print(f"    {line}")
+            return
+    except subprocess.TimeoutExpired:
+        if not quiet:
+            print("  ⚠ Build timed out (5 min limit)")
+        return
+
+    # Symlink binaries to ~/.local/bin/
+    target_dir = Path.home() / ".local/bin"
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    release_dir = b00t_dir / "target/release"
+    for name in ("b00t-cli", "b00t-mcp"):
+        src = release_dir / name
+        dst = target_dir / name
+        if src.is_file():
+            dst.unlink(missing_ok=True)
+            dst.symlink_to(src)
+            if not quiet:
+                print(f"  ✓ {name} -> {dst}")
+
+    if not quiet:
+        print("  ✓ b00t binaries updated")
+
+
 def _run_pre_update_backup(args) -> None:
     """Create a full zip backup of HERMES_HOME before running the update.
 
@@ -7151,6 +7315,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         print()
         print("✓ Update complete!")
+
+        # Post-update: update b00t ecosystem (CLI + MCP) if present
+        try:
+            _update_b00t_if_present(quiet=assume_yes)
+        except Exception as e:
+            logger.debug("b00t post-update hook failed: %s", e)
 
         # Curator first-run heads-up. Only prints when curator is enabled AND
         # has never run — i.e. the window where the ticker would otherwise
