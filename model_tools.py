@@ -674,32 +674,32 @@ def handle_function_call(
         if function_name in _AGENT_LOOP_TOOLS:
             return json.dumps({"error": f"{function_name} must be handled by the agent loop"})
 
-        # Check plugin hooks for a block directive (unless caller already
+        # Check plugin hooks for pre-tool directives (unless caller already
         # checked — e.g. run_agent._invoke_tool passes skip=True to
         # avoid double-firing the hook).
         #
         # Single-fire contract: pre_tool_call fires exactly once per tool
-        # execution. get_pre_tool_call_block_message() internally calls
+        # execution. get_pre_tool_call_directives() internally calls
         # invoke_hook("pre_tool_call", ...) and returns the first block
-        # directive (if any), so observer plugins see the hook on that same
-        # pass. When skip=True, the caller already fired it — do nothing
-        # here.
+        # directive and/or first rewrite directive from that same pass, so
+        # observer plugins see one hook invocation. When skip=True, the
+        # caller already fired it — do nothing here.
         if not skip_pre_tool_call_hook:
-            block_message: Optional[str] = None
             try:
-                from hermes_cli.plugins import get_pre_tool_call_block_message
-                block_message = get_pre_tool_call_block_message(
+                from hermes_cli.plugins import get_pre_tool_call_directives
+                _block_msg, _rewritten = get_pre_tool_call_directives(
                     function_name,
                     function_args,
                     task_id=task_id or "",
                     session_id=session_id or "",
                     tool_call_id=tool_call_id or "",
                 )
+                if _block_msg is not None:
+                    return json.dumps({"error": _block_msg}, ensure_ascii=False)
+                if _rewritten is not None:
+                    function_args = _rewritten
             except Exception:
                 pass
-
-            if block_message is not None:
-                return json.dumps({"error": block_message}, ensure_ascii=False)
 
         # Notify the read-loop tracker when a non-read/search tool runs,
         # so the *consecutive* counter resets (reads after other work are fine).
